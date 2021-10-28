@@ -105,6 +105,8 @@
 
 (defvar sketch-call-buffer nil)
 
+(defvar sketch-snippet nil)
+
 (defvar sketch-lisp-buffer-name nil)
 (defvar sketch-side-window-max-width (lambda () (- 1 (/ (float (car
                                                                 (image-size
@@ -375,7 +377,8 @@ If value of variable ‘sketch-show-labels' is ‘layer', create ..."
                            ('polygon "g")
                            ('freehand "f")
                            ('text "t")
-                           ('group "g"))))
+                           ('group "g")
+                           ('snippet "s"))))
          (idx 0)
          (label (concat prefix (number-to-string idx)))
          (labels (sketch-labels-list)))
@@ -1244,14 +1247,14 @@ returned by the function `sketch-parse-transform-string'"
       (setq sketch-layers-list (dom-by-id sketch-root "layer"))
       (sketch-redraw))))
 
-(defun sketch-modify-object (&optional group)
+(defun sketch-modify-object (&optional node)
   (interactive)
   (let ((show-labels sketch-show-labels))
     (setq sketch-show-labels "all")
     (sketch-toolbar-refresh)
     (sketch-redraw)
-    (let* ((object-label (if group
-                             group
+    (let* ((object-label (if node
+                             node
                            (completing-read "Transform element with id: "
                                             (sketch-labels-list))))
            (buffer (get-buffer-create (format "*sketch-object-%s*" object-label))))
@@ -1630,6 +1633,194 @@ color."
     (add-to-list 'mode-line-format '(:eval sketch-cursor-position) t)))
 
 
+(defun sketch-coords-sum (coords-1 coords-2)
+  (cons (+ (car coords-1) (car coords-2))
+        (+ (cdr coords-1) (cdr coords-2))))
+
+(defun sketch-coords-diff (coords-1 coords-2)
+  (cons (- (car coords-1) (car coords-2))
+        (- (cdr coords-1) (cdr coords-2))))
+
+(defun sketch-coords-scale (coords factor)
+  (cons (* factor (car coords))
+        (* factor (cdr coords))))
+
+(defun sketch-coords-cross (coords-1 coords-2)
+  (- (* (car coords-1) (cdr coords-2))
+     (* (cdr coords-1) (car coords-2))))
+
+(defun sketch-line-start (coords)
+  (cons (nth 0 coords) (nth 1 coords)))
+
+(defun sketch-line-end (coords)
+  (cons (nth 2 coords) (nth 3 coords)))
+
+(defun sketch-lines-intersection (coords-1 coords-2)
+  (let* ((p (sketch-line-start coords-1))
+         (q (sketch-line-start coords-2))
+         (r (sketch-coords-diff (sketch-line-end coords-1) p))
+         (s (sketch-coords-diff (sketch-line-end coords-2) q))
+         (lines-vectors-cross (pcase (sketch-coords-cross r s)
+                                (0 (user-error "Lines are parallel"))
+                                (val val)))
+         (u (/ (float (sketch-coords-cross (sketch-coords-diff q p) r))
+               lines-vectors-cross)))
+    (sketch-coords-sum q (sketch-coords-scale s u))))
+
+(defun sketch-calculate-angle-arc (line1-coords line2-coords arc-radius part)
+  "Draw angle arc in positive angle direction."
+  (goto-char (point-min))
+  (let* ((image-size (image-size (get-char-property (point) 'display) t))
+         (intersection (pcase (sketch-lines-intersection line1-coords line2-coords)
+                         ((pred (lambda (x) (or (> (car x) (car image-size))
+                                                (> (cdr x) (cdr image-size)))))
+                          (user-error "Lines cross outside of image"))
+                         (val val)))
+         (slope1-angle (atan (/ (float (- (nth 3 line1-coords) (nth 1 line1-coords)))
+                                (- (nth 2 line1-coords) (nth 0 line1-coords)))))
+         (slope2-angle (atan(/ (float (- (nth 3 line2-coords) (nth 1 line2-coords)))
+                               (- (nth 2 line2-coords) (nth 0 line2-coords)))))
+         (start-angle (min slope1-angle slope2-angle))
+         (stop-angle (max slope1-angle slope2-angle))
+         (p1 (cons (+ (car intersection) (* arc-radius (cos start-angle)))
+                   (+ (cdr intersection) (* arc-radius (sin start-angle)))))
+         (p2 (cons (+ (car intersection) (* arc-radius (cos stop-angle)))
+                   (+ (cdr intersection) (* arc-radius (sin stop-angle)))))
+         (p3 (cons (- (car intersection) (* arc-radius (cos start-angle)))
+                   (- (cdr intersection) (* arc-radius (sin start-angle)))))
+         (p4 (cons (- (car intersection) (* arc-radius (cos stop-angle)))
+                   (- (cdr intersection) (* arc-radius (sin stop-angle))))))
+    (pcase part
+      (1 (cons p1 p2))
+      (2 (cons p2 p3))
+      (3 (cons p3 p4))
+      (4 (cons p4 p1))
+      (_ (user-error "Part should be a number between 1 and 4")))))
+
+(defun sketch-read-label (prompt)
+  (completing-read prompt
+                   (sketch-labels-list)))
+
+(defun sketch-add-angle-arc (orientation &optional label-1 label-2)
+  (interactive (list 1))
+  (let* ((label-1 (or label-1 (sketch-read-label "From line: ")))
+         (label-2 (or label-2 (sketch-read-label "To line: ")))
+         (line-1 (car (dom-by-id sketch-svg (format "^%s$" label-1))))
+         (line-2 (car (dom-by-id sketch-svg (format "^%s$" label-2))))
+         (label (sketch-create-label "arc")))
+
+    (defun sketch-draw-arc (orientation label-1 label-2)
+      (let ((end-points (sketch-calculate-angle-arc (mapcar (lambda (coord)
+                                                              (alist-get coord (cadr line-1)))
+                                                            '(x1 y1 x2 y2))
+                                                    (mapcar (lambda (coord)
+                                                              (alist-get coord (cadr line-2)))
+                                                            '(x1 y1 x2 y2))
+                                                    20
+                                                    orientation)))
+        (svg-path (nth sketch-active-layer sketch-layers-list) `((moveto (,(car end-points)))
+                                                                 (elliptical-arc
+                                                                  ((20 20 ,(cadr end-points) ,(cddr end-points) :sweep t))))
+                  :id label :part orientation :lines (cons label-1 label-2) :fill "transparent" :stroke "black")
+        (print (sketch-redraw))))
+    ;; (sketch-modify-angle label)))
+
+    (defun sketch-rotate-angle ()
+      (let* ((angle (print (car (dom-by-id sketch-root (format "^%s$" label)))))
+             (part (print (dom-attr angle 'part))))
+        (svg-remove (nth sketch-active-layer sketch-layers-list) (format "%s" label))
+        (sketch-draw-arc (if (= part 4) 1 (1+ part)) label-1 label-2)))
+
+    (sketch-draw-arc 1 label-1 label-2)
+      (while (yes-or-no-p "Different part?")
+        (sketch-rotate-angle))))
+
+(defun sketch-snippet-get-dom (svg-file)
+  (interactive "fCreate dom from file: ")
+  (with-temp-buffer "svg"
+                    (insert-file-contents-literally svg-file)
+                    (xml-remove-comments (point-min) (point-max))
+                    (libxml-parse-xml-region (point-min) (point-max))))
+
+(defun sketch-snippets-add-ids (dom)
+  (let ((idx 0))
+    (dolist (n (dom-by-tag dom 'g))
+      (dom-set-attribute n 'id (number-to-string idx))
+      (setq idx (1+ idx)))))
+
+(defun sketch-snippets-add-labels (dom)
+  (interactive "f")
+  (sketch-snippets-add-ids dom)
+  (mapc (lambda (n)
+          (let* ((s (dom-attr n 'transform))
+                 (coords (when s
+                           (split-string
+                            (string-trim
+                             s
+                             "translate(" ")")
+                            ","))))
+            (svg-text dom
+                      (dom-attr n 'id)
+                      :x (car coords)
+                      :y (cadr coords)
+                      :font-size 10
+                      :stroke "red"
+                      :fill "red")))
+        (cdr (dom-by-tag dom 'g)))
+  ;; (save-current-buffer
+  ;; (when lisp-buffer
+  ;;   (sketch-update-lisp-window lisp lisp-buffer))
+  ;; (let ((lisp-window (or (get-buffer-window "*sketch-root*")
+  ;;                        (get-buffer-window lisp-buffer))))
+  ;;   (unless (string= (buffer-name (window-buffer lisp-window)) "*sketch*")
+  ;;     (if-let (buf (get-buffer"*sketch-root*"))
+  ;;         (sketch-update-lisp-window sketch-root buf)
+  ;;       (sketch-update-lisp-window lisp lisp-buffer))))
+  ;; (setq sketch-root (append (seq-subseq sketch-root 0 2) (list (nth (car show-layers) svg-layers))))
+  ;; (dolist (layer (cdr show-layers))
+  ;;   (setq sketch-root (append sketch-root (list (nth layer svg-layers)))))
+  ;; (setq sketch-svg (append svg-canvas
+  ;;                          (when sketch-show-grid (list sketch-grid))
+  ;;                          (when sketch-show-labels (list (sketch-labels)))
+  ;;                          (list sketch-root)))
+  (let ((inhibit-read-only t))
+    (erase-buffer) ;; a (not exact) alternative is to use (kill-backward-chars 1)
+    (insert-image (svg-image dom))))
+
+(defun sketch-insert-snippet (coords)
+  ;; (interactive "@e")
+  (let (
+        ;; (coords (posn-object-x-y (event-start event)))
+        (label (sketch-create-label 'snippet)))
+    (dom-set-attribute sketch-snippet
+                       'transform
+                       (format "translate(%s,%s)" (car coords) (cdr coords)))
+    (dom-set-attribute sketch-snippet
+                       'id
+                       label)
+    (dom-append-child (nth sketch-active-layer sketch-layers-list) sketch-snippet)
+    (sketch-redraw)))
+    ;; (sketch-modify-object label)))
+
+(defun sketch-import (svg-file)
+  (interactive (list (let ((default-directory (concat
+                                               (file-name-directory (locate-library "sketch-mode"))
+                                               "snippet-files/")))
+                       (read-file-name "Import (object) from file: "))))
+  (let* ((dom (sketch-snippet-get-dom svg-file))
+         (has-groups (dom-by-tag dom 'g)))
+    (when has-groups (sketch-snippets-add-labels dom))
+    (let* ((idx (when has-groups (read-number "Number of object for import: ")))
+           (snippet (if (dom-by-tag dom 'g)
+                        (dom-elements dom 'id (number-to-string idx))
+                      (list (dom-append-child
+                             (sketch-group (sketch-create-label 'group))
+                             (car (dom-children dom)))))))
+      (setq sketch-snippet (car snippet))
+      (sketch-redraw)
+      ;; (while (not (eq (car event) 'down-mouse-1))
+        (let ((event (read-event "Click mouse-1 to insert")))
+          (sketch-insert-snippet (posn-object-x-y (event-start event)))))))
 
 (add-hook 'org-ctrl-c-ctrl-c-final-hook 'sketch-org-toggle-image)
 
